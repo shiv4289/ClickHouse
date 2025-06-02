@@ -499,6 +499,11 @@ size_t MergeTreeRangeReader::ReadResult::countDroppedGranules(const FilterWithCa
     for (size_t granule_idx = 0; granule_idx < rows_per_granule.size(); ++granule_idx)
     {
         size_t num_rows_in_granule = rows_per_granule[granule_idx];
+        if (row_offset + num_rows_in_granule > filter_data.size())
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Filter size mismatch: expected at least {} rows, got {}",
+                row_offset + num_rows_in_granule, filter_data.size());
+
         bool granule_contains_passing_rows = std::any_of(
             filter_data.begin() + row_offset,
             filter_data.begin() + row_offset + num_rows_in_granule,
