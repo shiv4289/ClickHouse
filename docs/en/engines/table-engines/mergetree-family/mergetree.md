@@ -441,7 +441,7 @@ Indexes of type `set` can be utilized by all functions. The other index types ar
 | Function (operator) / Index                                                                                | primary key | minmax | ngrambf_v1 | tokenbf_v1 | bloom_filter | full_text |
 |------------------------------------------------------------------------------------------------------------|-------------|--------|------------|------------|--------------|-----------|
 | [equals (=, ==)](/sql-reference/functions/comparison-functions.md/#equals)                         | ✔           | ✔      | ✔          | ✔          | ✔            | ✔         |
-| [notEquals(!=, &lt;&gt;)](/sql-reference/functions/comparison-functions.md/#notequals)             | ✔           | ✔      | ✔          | ✔          | ✔            | ✔         |
+| [notEquals(!=, &lt;&gt;)](/sql-reference/functions/comparison-functions.md/#notEquals)             | ✔           | ✔      | ✔          | ✔          | ✔            | ✔         |
 | [like](/sql-reference/functions/string-search-functions.md/#like)                                  | ✔           | ✔      | ✔          | ✔          | ✗            | ✔         |
 | [notLike](/sql-reference/functions/string-search-functions.md/#notlike)                            | ✔           | ✔      | ✔          | ✔          | ✗            | ✔         |
 | [match](/sql-reference/functions/string-search-functions.md/#match)                                | ✗           | ✗      | ✔          | ✔          | ✗            | ✔         |
@@ -452,13 +452,13 @@ Indexes of type `set` can be utilized by all functions. The other index types ar
 | [notIn](/sql-reference/functions/in-functions)                                                     | ✔           | ✔      | ✔          | ✔          | ✔            | ✔         |
 | [less (`<`)](/sql-reference/functions/comparison-functions.md/#less)                                 | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
 | [greater (`>`)](/sql-reference/functions/comparison-functions.md/#greater)                           | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
-| [lessOrEquals (`<=`)](/sql-reference/functions/comparison-functions.md/#lessorequals)                | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
-| [greaterOrEquals (`>=`)](/sql-reference/functions/comparison-functions.md/#greaterorequals)          | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
+| [lessOrEquals (`<=`)](/sql-reference/functions/comparison-functions.md/#lessOrEquals)                | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
+| [greaterOrEquals (`>=`)](/sql-reference/functions/comparison-functions.md/#greaterOrEquals)          | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
 | [empty](/sql-reference/functions/array-functions/#empty)                                           | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
-| [notEmpty](/sql-reference/functions/array-functions/#notempty)                                     | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
-| [has](/sql-reference/functions/array-functions#hasarr-elem)                                               | ✗           | ✗      | ✔          | ✔          | ✔            | ✔         |
-| [hasAny](/sql-reference/functions/array-functions#hasany)                                         | ✗           | ✗      | ✔          | ✔          | ✔            | ✗         |
-| [hasAll](/sql-reference/functions/array-functions#hasall)                                         | ✗           | ✗      | ✔          | ✔          | ✔            | ✗         |
+| [notEmpty](/sql-reference/functions/array-functions/#notEmpty)                                     | ✔           | ✔      | ✗          | ✗          | ✗            | ✗         |
+| [has](/sql-reference/functions/array-functions#has)                                               | ✗           | ✗      | ✔          | ✔          | ✔            | ✔         |
+| [hasAny](/sql-reference/functions/array-functions#hasAny)                                         | ✗           | ✗      | ✔          | ✔          | ✔            | ✗         |
+| [hasAll](/sql-reference/functions/array-functions#hasAll)                                         | ✗           | ✗      | ✔          | ✔          | ✔            | ✗         |
 | hasToken                                                                                                   | ✗           | ✗      | ✗          | ✔          | ✗            | ✔         |
 | hasTokenOrNull                                                                                             | ✗           | ✗      | ✗          | ✔          | ✗            | ✔         |
 | hasTokenCaseInsensitive (*)                                                                                | ✗           | ✗      | ✗          | ✔          | ✗            | ✗         |
@@ -974,6 +974,7 @@ ClickHouse versions 22.3 through 22.7 use a different cache configuration, see [
 - `_partition_value` — Values (a tuple) of a `partition by` expression.
 - `_sample_factor` — Sample factor (from the query).
 - `_block_number` — Block number of the row, it is persisted on merges when `allow_experimental_block_number_column` is set to true.
+- `_disk_name` — Disk name used for the storage.
 
 ## Column Statistics {#column-statistics}
 
