@@ -11,7 +11,10 @@
 #include <QueryPipeline/Pipe.h>
 #include <base/UUID.h>
 
+#include <condition_variable>
+#include <functional>
 #include <optional>
+#include <unordered_set>
 
 namespace DB
 {
@@ -148,13 +151,20 @@ public:
     void updateConfiguration(size_t max_size_in_bytes, size_t max_entries, size_t max_entry_size_in_bytes_, size_t max_entry_size_in_rows_);
 
     QueryResultCacheReader createReader(const Key & key);
-    QueryResultCacheWriter createWriter(
+    std::shared_ptr<QueryResultCacheWriter> createWriter(
         const Key & key,
         std::chrono::milliseconds min_query_runtime,
         bool squash_partial_results,
         size_t max_block_size,
         size_t max_query_result_cache_size_in_bytes_quota,
         size_t max_query_result_cache_entries_quota);
+
+    /// Blocks the calling thread while another, concurrently running query is writing a result for the same key into the cache
+    /// ("query B waits for query A"). This allows B to reuse ("steal") the entry that A is about to insert into the cache instead of
+    /// having both A and B compute the same, potentially expensive result independently.
+    /// Does nothing if no such write is in progress. `is_query_cancelled` is polled periodically while waiting so that killing the
+    /// calling (B's) query does not block it forever, e.g. if A's query runs into 'max_execution_time' or hangs.
+    void waitForConcurrentInsert(const Key & key, const std::function<bool()> & is_query_cancelled);
 
     void clear(const std::optional<String> & tag);
 
@@ -180,6 +190,15 @@ private:
     size_t max_entry_size_in_bytes TSA_GUARDED_BY(mutex) = 0;
     size_t max_entry_size_in_rows TSA_GUARDED_BY(mutex) = 0;
 
+    /// Keys for which a QueryResultCacheWriter currently exists and may still insert an entry into 'cache'. Used to synchronize
+    /// concurrent queries which run the same (deterministic) SELECT: while one of them computes the result and is about to store it in
+    /// the cache, the others wait for it to finish instead of also computing (and later also caching) the same result.
+    std::unordered_set<Key, KeyHasher> in_flight_writes TSA_GUARDED_BY(mutex);
+    std::condition_variable in_flight_writes_cv;
+
+    /// Unregisters 'key' as being written and wakes up threads blocked in waitForConcurrentInsert(). Called by QueryResultCacheWriter.
+    void finishWrite(const Key & key);
+
     friend class StorageSystemQueryResultCache;
     friend class QueryResultCacheWriter;
     friend class QueryResultCacheReader;
@@ -196,10 +215,19 @@ private:
 /// inserting anything).
 /// Queries may also be cancelled by the user, in which case IProcessor's cancel bit is set. FinalizeWrite() is only called if the
 /// cancel bit is not set.
+///
+/// Synchronization of concurrent queries: While a Writer for a given key exists, it is registered in the owning QueryResultCache
+/// (see QueryResultCache::in_flight_writes) so that other, concurrently running queries with the same key can wait for it to finish
+/// instead of redundantly computing the same result (QueryResultCache::waitForConcurrentInsert()). The registration is undone exactly
+/// once, either at the end of finalizeWrite() (the regular case) or, if finalizeWrite() is never called (exception/cancellation), in the
+/// destructor. Either way, once a Writer is unregistered, waiting queries wake up and re-probe the cache: they either find the entry the
+/// Writer just inserted ("steal" it) or, if the Writer aborted or decided not to cache the result, fall back to computing it themselves.
 class QueryResultCacheWriter
 {
 public:
-    QueryResultCacheWriter(const QueryResultCacheWriter & other);
+    QueryResultCacheWriter(const QueryResultCacheWriter &) = delete;
+    QueryResultCacheWriter & operator=(const QueryResultCacheWriter &) = delete;
+    ~QueryResultCacheWriter();
 
     enum class ChunkType : uint8_t
     {
@@ -214,6 +242,7 @@ private:
     using Cache = QueryResultCache::Cache;
 
     std::mutex mutex;
+    QueryResultCache & query_result_cache;
     Cache & cache;
     const QueryResultCache::Key key;
     const size_t max_entry_size_in_bytes;
@@ -225,11 +254,20 @@ private:
     Cache::MappedPtr query_result TSA_GUARDED_BY(mutex) = std::make_shared<QueryResultCache::Entry>();
     std::atomic<bool> skip_insert = false;
     bool was_finalized = false;
+    /// Whether this Writer is currently registered in query_result_cache.in_flight_writes for 'key', i.e. whether it still needs to
+    /// unregister itself (in finalizeWrite() or, failing that, in the destructor). Only ever accessed by the single thread which calls
+    /// buffer()/finalizeWrite(), respectively by the destructor after that thread is done with this object, so no separate lock is needed.
+    bool registered_as_in_flight_write = false;
     LoggerPtr logger = getLogger("QueryResultCache");
 
+    /// 'skip_insert_' and 'registered_as_in_flight_write_' are determined by QueryResultCache::createWriter() while it holds
+    /// QueryResultCache::mutex, i.e. atomically with respect to other concurrent createWriter()/waitForConcurrentInsert() calls.
     QueryResultCacheWriter(
+        QueryResultCache & query_result_cache_,
         Cache & cache_,
         const Cache::Key & key_,
+        bool skip_insert_,
+        bool registered_as_in_flight_write_,
         size_t max_entry_size_in_bytes_,
         size_t max_entry_size_in_rows_,
         std::chrono::milliseconds min_query_runtime_,

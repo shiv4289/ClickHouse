@@ -4887,6 +4887,18 @@ Possible values:
 
 - Any string
 )", 0) \
+    DECLARE(Bool, query_cache_synchronize_concurrent_queries, true, R"(
+If turned on, a `SELECT` query whose result is not (yet) in the [query cache](../query-cache.md) checks if another, identical query is
+already running and about to store its result in the query cache. If so, the query waits for the concurrent query to finish and reuses
+("steals") its result instead of computing the same, potentially expensive result a second time. If the concurrently running query fails,
+is cancelled, or decides not to cache its result (e.g. because of [query_cache_min_query_runs](#query_cache_min_query_runs) or
+[query_cache_min_query_duration](#query_cache_min_query_duration)), the waiting query computes the result itself.
+
+Possible values:
+
+- 0 - Disabled
+- 1 - Enabled
+)", 0) \
     DECLARE(Bool, enable_sharing_sets_for_mutations, true, R"(
 Allow sharing set objects build for IN subqueries between different tasks of the same mutation. This reduces memory usage and CPU consumption
 )", 0) \

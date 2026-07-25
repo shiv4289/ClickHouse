@@ -146,6 +146,7 @@ namespace Setting
     extern const SettingsQueryResultCacheNondeterministicFunctionHandling query_cache_nondeterministic_function_handling;
     extern const SettingsBool query_cache_share_between_users;
     extern const SettingsBool query_cache_squash_partial_results;
+    extern const SettingsBool query_cache_synchronize_concurrent_queries;
     extern const SettingsQueryResultCacheSystemTableHandling query_cache_system_table_handling;
     extern const SettingsSeconds query_cache_ttl;
     extern const SettingsInt64 query_metric_log_interval;
@@ -1431,7 +1432,30 @@ static BlockIO executeQueryImpl(
                 return false;
             };
 
-            if (!get_result_from_query_result_cache())
+            /// If the query result was not (yet) found in the cache, check whether another, concurrently running query with the same
+            /// cache key is currently computing it and about to insert it into the query result cache. If so, wait for that query to
+            /// finish and retry the cache lookup instead of also computing (and later also caching) the same, potentially expensive
+            /// result. This is purely an optimization: if no concurrent write is in progress, if it fails/is cancelled, or if it decides
+            /// not to cache its result after all, we simply fall through and compute the result ourselves, exactly as before.
+            auto wait_for_concurrent_query_and_retry_read_from_query_result_cache = [&]()
+            {
+                if (!(out_ast && can_use_query_result_cache && settings[Setting::enable_reads_from_query_cache]
+                      && settings[Setting::query_cache_synchronize_concurrent_queries]))
+                    return false;
+
+                QueryResultCache::Key key(out_ast, context->getCurrentDatabase(), *settings_copy, context->getCurrentQueryId(), context->getUserID(), context->getCurrentRoles());
+                query_result_cache->waitForConcurrentInsert(
+                    key,
+                    [&]() { return process_list_entry && process_list_entry->getQueryStatus()->isKilled(); });
+
+                if (process_list_entry && process_list_entry->getQueryStatus()->isKilled())
+                    throw Exception(ErrorCodes::QUERY_WAS_CANCELLED,
+                        "Query '{}' is killed in pending state", context->getCurrentQueryId());
+
+                return get_result_from_query_result_cache();
+            };
+
+            if (!get_result_from_query_result_cache() && !wait_for_concurrent_query_and_retry_read_from_query_result_cache())
             {
                 /// We need to start the (implicit) transaction before getting the interpreter as this will get links to the latest snapshots
                 if (!context->getCurrentTransaction() && settings[Setting::implicit_transaction] && !(out_ast && out_ast->as<ASTTransactionControl>()))
@@ -1564,13 +1588,13 @@ static BlockIO executeQueryImpl(
                             }
                             else
                             {
-                                auto query_result_cache_writer = std::make_shared<QueryResultCacheWriter>(query_result_cache->createWriter(
+                                auto query_result_cache_writer = query_result_cache->createWriter(
                                                  key,
                                                  std::chrono::milliseconds(settings[Setting::query_cache_min_query_duration].totalMilliseconds()),
                                                  settings[Setting::query_cache_squash_partial_results],
                                                  settings[Setting::max_block_size],
                                                  settings[Setting::query_cache_max_size_in_bytes],
-                                                 settings[Setting::query_cache_max_entries]));
+                                                 settings[Setting::query_cache_max_entries]);
                                 res.pipeline.writeResultIntoQueryResultCache(query_result_cache_writer);
                                 query_result_cache_usage = QueryResultCacheUsage::Write;
                             }

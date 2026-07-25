@@ -22,12 +22,14 @@
 #include <Common/quoteString.h>
 #include <Core/Settings.h>
 #include <base/defines.h> /// chassert
+#include <base/scope_guard.h>
 
 
 namespace ProfileEvents
 {
     extern const Event QueryCacheHits;
     extern const Event QueryCacheMisses;
+    extern const Event QueryCacheSynchronizedQueries;
 };
 
 namespace DB
@@ -334,37 +336,38 @@ bool QueryResultCache::IsStale::operator()(const Key & key) const
 };
 
 QueryResultCacheWriter::QueryResultCacheWriter(
+    QueryResultCache & query_result_cache_,
     Cache & cache_,
     const QueryResultCache::Key & key_,
+    bool skip_insert_,
+    bool registered_as_in_flight_write_,
     size_t max_entry_size_in_bytes_,
     size_t max_entry_size_in_rows_,
     std::chrono::milliseconds min_query_runtime_,
     bool squash_partial_results_,
     size_t max_block_size_)
-    : cache(cache_)
+    : query_result_cache(query_result_cache_)
+    , cache(cache_)
     , key(key_)
     , max_entry_size_in_bytes(max_entry_size_in_bytes_)
     , max_entry_size_in_rows(max_entry_size_in_rows_)
     , min_query_runtime(min_query_runtime_)
     , squash_partial_results(squash_partial_results_)
     , max_block_size(max_block_size_)
+    , skip_insert(skip_insert_)
+    , registered_as_in_flight_write(registered_as_in_flight_write_)
 {
-    if (auto entry = cache.getWithKey(key); entry.has_value() && !QueryResultCache::IsStale()(entry->key))
-    {
-        skip_insert = true; /// Key already contained in cache and did not expire yet --> don't replace it
+    if (skip_insert_)
         LOG_TRACE(logger, "Skipped insert because the cache contains a non-stale query result for query {}", doubleQuoteString(key.query_string));
-    }
 }
 
-QueryResultCacheWriter::QueryResultCacheWriter(const QueryResultCacheWriter & other)
-    : cache(other.cache)
-    , key(other.key)
-    , max_entry_size_in_bytes(other.max_entry_size_in_bytes)
-    , max_entry_size_in_rows(other.max_entry_size_in_rows)
-    , min_query_runtime(other.min_query_runtime)
-    , squash_partial_results(other.squash_partial_results)
-    , max_block_size(other.max_block_size)
+QueryResultCacheWriter::~QueryResultCacheWriter()
 {
+    /// Normally, finalizeWrite() already unregistered this Writer. This is a fallback for the case that finalizeWrite() was never
+    /// called, i.e. the query failed or was cancelled and no result must be (or was) cached. Queries waiting in
+    /// waitForConcurrentInsert() for this key wake up, find no entry in the cache and fall back to computing the result themselves.
+    if (registered_as_in_flight_write)
+        query_result_cache.finishWrite(key);
 }
 
 void QueryResultCacheWriter::buffer(Chunk && chunk, ChunkType chunk_type)
@@ -414,6 +417,16 @@ void QueryResultCacheWriter::finalizeWrite()
 {
     if (skip_insert)
         return;
+
+    /// Once we leave finalizeWrite() (successfully or not), the result - if any - is either fully in the cache or won't be cached at
+    /// all. Either way, queries waiting in waitForConcurrentInsert() no longer need to (and must not continue to) wait for us.
+    SCOPE_EXIT({
+        if (registered_as_in_flight_write)
+        {
+            query_result_cache.finishWrite(key);
+            registered_as_in_flight_write = false;
+        }
+    });
 
     std::lock_guard lock(mutex);
 
@@ -659,7 +672,7 @@ QueryResultCacheReader QueryResultCache::createReader(const Key & key)
     return QueryResultCacheReader(cache, key, lock);
 }
 
-QueryResultCacheWriter QueryResultCache::createWriter(
+std::shared_ptr<QueryResultCacheWriter> QueryResultCache::createWriter(
     const Key & key,
     std::chrono::milliseconds min_query_runtime,
     bool squash_partial_results,
@@ -675,7 +688,55 @@ QueryResultCacheWriter QueryResultCache::createWriter(
         cache.setQuotaForUser(*key.user_id, max_query_result_cache_size_in_bytes_quota, max_query_result_cache_entries_quota);
 
     std::lock_guard lock(mutex);
-    return QueryResultCacheWriter(cache, key, max_entry_size_in_bytes, max_entry_size_in_rows, min_query_runtime, squash_partial_results, max_block_size);
+
+    bool skip_insert = false;
+    if (auto entry = cache.getWithKey(key); entry.has_value() && !IsStale()(entry->key))
+        skip_insert = true; /// Key already contained in cache and did not expire yet --> don't replace it
+
+    /// If we are going to insert into the cache, register this write so that other, concurrently running queries with the same key can
+    /// wait for it to finish and reuse ("steal") its result instead of also computing it (see waitForConcurrentInsert()). Both the
+    /// cache lookup above and the registration happen while 'mutex' is held, so that a concurrent waitForConcurrentInsert() call for the
+    /// same key either observes the registration or not, but never misses a write that is about to start.
+    bool registered_as_in_flight_write = false;
+    if (!skip_insert)
+        registered_as_in_flight_write = in_flight_writes.insert(key).second;
+
+    /// Constructed via 'new' (as opposed to std::make_shared) because the constructor is private and only QueryResultCache is a friend.
+    /// Must be wrapped into a shared_ptr right away (as opposed to e.g. returning by value) so that the object has a single, stable
+    /// identity: it may be referenced by 'in_flight_writes' above and by multiple StreamInQueryResultCacheTransform processors.
+    return std::shared_ptr<QueryResultCacheWriter>(new QueryResultCacheWriter(
+        *this, cache, key, skip_insert, registered_as_in_flight_write,
+        max_entry_size_in_bytes, max_entry_size_in_rows, min_query_runtime, squash_partial_results, max_block_size));
+}
+
+void QueryResultCache::waitForConcurrentInsert(const Key & key, const std::function<bool()> & is_query_cancelled)
+{
+    /// Poll periodically for cancellation instead of waiting indefinitely: the query that is currently writing this key may itself run
+    /// for a long time (or, in pathological cases, hang), and we must not prevent the calling (waiting) query from being killed.
+    static constexpr auto poll_interval = std::chrono::milliseconds(100);
+
+    std::unique_lock lock(mutex);
+
+    bool waited = false;
+    while (in_flight_writes.contains(key))
+    {
+        if (is_query_cancelled && is_query_cancelled())
+            return;
+        waited = true;
+        in_flight_writes_cv.wait_for(lock, poll_interval);
+    }
+
+    if (waited)
+        ProfileEvents::increment(ProfileEvents::QueryCacheSynchronizedQueries);
+}
+
+void QueryResultCache::finishWrite(const Key & key)
+{
+    {
+        std::lock_guard lock(mutex);
+        in_flight_writes.erase(key);
+    }
+    in_flight_writes_cv.notify_all();
 }
 
 void QueryResultCache::clear(const std::optional<String> & tag)

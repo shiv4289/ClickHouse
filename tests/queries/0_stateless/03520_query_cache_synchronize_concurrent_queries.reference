@@ -1,0 +1,10 @@
+Number of query_log entries with query_cache_usage = 'Write' (must be 1 -- only the leader computed and cached the result):
+1
+Number of query_log entries with query_cache_usage = 'Read' (must be 4 -- all followers reused the leader's result):
+4
+Number of query_cache entries for this query (must be 1 -- no duplicate/redundant inserts happened):
+1
+Sum of ProfileEvents['QueryCacheSynchronizedQueries'] across all 5 queries (must be 4, one per follower):
+4
+Follower of a failing leader must return promptly with the same error (not hang):
+FUNCTION_THROW_IF_VALUE_IS_NON_ZERO
