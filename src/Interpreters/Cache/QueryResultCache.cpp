@@ -340,7 +340,7 @@ QueryResultCacheWriter::QueryResultCacheWriter(
     Cache & cache_,
     const QueryResultCache::Key & key_,
     bool skip_insert_,
-    bool registered_as_in_flight_write_,
+    std::shared_ptr<QueryResultCache::InFlightWrite> in_flight_write_,
     size_t max_entry_size_in_bytes_,
     size_t max_entry_size_in_rows_,
     std::chrono::milliseconds min_query_runtime_,
@@ -355,19 +355,10 @@ QueryResultCacheWriter::QueryResultCacheWriter(
     , squash_partial_results(squash_partial_results_)
     , max_block_size(max_block_size_)
     , skip_insert(skip_insert_)
-    , registered_as_in_flight_write(registered_as_in_flight_write_)
+    , in_flight_registration(query_result_cache_, key_, std::move(in_flight_write_))
 {
     if (skip_insert_)
         LOG_TRACE(logger, "Skipped insert because the cache contains a non-stale query result for query {}", doubleQuoteString(key.query_string));
-}
-
-QueryResultCacheWriter::~QueryResultCacheWriter()
-{
-    /// Normally, finalizeWrite() already unregistered this Writer. This is a fallback for the case that finalizeWrite() was never
-    /// called, i.e. the query failed or was cancelled and no result must be (or was) cached. Queries waiting in
-    /// waitForConcurrentInsert() for this key wake up, find no entry in the cache and fall back to computing the result themselves.
-    if (registered_as_in_flight_write)
-        query_result_cache.finishWrite(key);
 }
 
 void QueryResultCacheWriter::buffer(Chunk && chunk, ChunkType chunk_type)
@@ -420,13 +411,8 @@ void QueryResultCacheWriter::finalizeWrite()
 
     /// Once we leave finalizeWrite() (successfully or not), the result - if any - is either fully in the cache or won't be cached at
     /// all. Either way, queries waiting in waitForConcurrentInsert() no longer need to (and must not continue to) wait for us.
-    SCOPE_EXIT({
-        if (registered_as_in_flight_write)
-        {
-            query_result_cache.finishWrite(key);
-            registered_as_in_flight_write = false;
-        }
-    });
+    /// unregister() is idempotent, so it is safe that the destructor of 'in_flight_registration' also calls it unconditionally later.
+    SCOPE_EXIT({ in_flight_registration.unregister(); });
 
     std::lock_guard lock(mutex);
 
@@ -694,49 +680,98 @@ std::shared_ptr<QueryResultCacheWriter> QueryResultCache::createWriter(
         skip_insert = true; /// Key already contained in cache and did not expire yet --> don't replace it
 
     /// If we are going to insert into the cache, register this write so that other, concurrently running queries with the same key can
-    /// wait for it to finish and reuse ("steal") its result instead of also computing it (see waitForConcurrentInsert()). Both the
-    /// cache lookup above and the registration happen while 'mutex' is held, so that a concurrent waitForConcurrentInsert() call for the
-    /// same key either observes the registration or not, but never misses a write that is about to start.
-    bool registered_as_in_flight_write = false;
+    /// wait for it to finish and reuse ("steal") its result instead of also computing it (see waitForConcurrentInsert()). The cache
+    /// lookup above and this registration are not covered by the very same lock (they use 'mutex' and 'in_flight_writes_mutex'
+    /// respectively, see the comment at 'in_flight_writes_mutex' for why they are separate locks), but that is fine: the registration
+    /// itself, i.e. "is somebody already registered for this key", is atomic because both the check and insert below happen while
+    /// 'in_flight_writes_mutex' is held, and that is the only property waitForConcurrentInsert() relies on.
+    std::shared_ptr<InFlightWrite> in_flight_write;
     if (!skip_insert)
-        registered_as_in_flight_write = in_flight_writes.insert(key).second;
+    {
+        std::lock_guard registry_lock(in_flight_writes_mutex);
+        auto [it, inserted] = in_flight_writes.try_emplace(key, nullptr);
+        if (inserted)
+        {
+            it->second = std::make_shared<InFlightWrite>();
+            in_flight_write = it->second;
+        }
+        /// else: another writer already registered for this key moments ago (a narrow, harmless race - see waitForConcurrentInsert()).
+        /// This Writer simply proceeds without being registered and inserts its own result at the end, exactly as before this feature
+        /// existed.
+    }
 
     /// Constructed via 'new' (as opposed to std::make_shared) because the constructor is private and only QueryResultCache is a friend.
     /// Must be wrapped into a shared_ptr right away (as opposed to e.g. returning by value) so that the object has a single, stable
     /// identity: it may be referenced by 'in_flight_writes' above and by multiple StreamInQueryResultCacheTransform processors.
     return std::shared_ptr<QueryResultCacheWriter>(new QueryResultCacheWriter(
-        *this, cache, key, skip_insert, registered_as_in_flight_write,
+        *this, cache, key, skip_insert, std::move(in_flight_write),
         max_entry_size_in_bytes, max_entry_size_in_rows, min_query_runtime, squash_partial_results, max_block_size));
 }
 
 void QueryResultCache::waitForConcurrentInsert(const Key & key, const std::function<bool()> & is_query_cancelled)
 {
     /// Poll periodically for cancellation instead of waiting indefinitely: the query that is currently writing this key may itself run
-    /// for a long time (or, in pathological cases, hang), and we must not prevent the calling (waiting) query from being killed.
-    static constexpr auto poll_interval = std::chrono::milliseconds(100);
+    /// for a long time (or, in pathological cases, hang), and we must not prevent the calling (waiting) query from being killed. This is
+    /// a deliberately simple, pragmatic choice: ClickHouse has no general mechanism today to push a "your query was killed" event into
+    /// an arbitrary condition variable, only to poll QueryStatus::isKilled(). A future improvement could shorten the worst-case wakeup
+    /// latency further by having query cancellation notify affected InFlightWrite condition variables directly.
+    static constexpr auto poll_interval = std::chrono::milliseconds(20);
 
-    std::unique_lock lock(mutex);
+    std::unique_lock lock(in_flight_writes_mutex);
+
+    auto it = in_flight_writes.find(key);
+    if (it == in_flight_writes.end())
+        return;
+    std::shared_ptr<InFlightWrite> write = it->second; /// keep it alive even after the map entry is erased while we wait below
 
     bool waited = false;
-    while (in_flight_writes.contains(key))
+    while (true)
     {
+        auto current_it = in_flight_writes.find(key);
+        if (current_it == in_flight_writes.end() || current_it->second != write)
+            break; /// the write we were waiting for has finished (successfully or not)
+
         if (is_query_cancelled && is_query_cancelled())
             return;
         waited = true;
-        in_flight_writes_cv.wait_for(lock, poll_interval);
+        write->cv.wait_for(lock, poll_interval);
     }
 
     if (waited)
         ProfileEvents::increment(ProfileEvents::QueryCacheSynchronizedQueries);
 }
 
-void QueryResultCache::finishWrite(const Key & key)
+void QueryResultCache::finishWrite(const Key & key, const std::shared_ptr<InFlightWrite> & write)
 {
     {
-        std::lock_guard lock(mutex);
-        in_flight_writes.erase(key);
+        std::lock_guard lock(in_flight_writes_mutex);
+        auto it = in_flight_writes.find(key);
+        if (it != in_flight_writes.end() && it->second == write)
+            in_flight_writes.erase(it);
     }
-    in_flight_writes_cv.notify_all();
+    write->cv.notify_all(); /// only wakes up queries waiting for *this* key, see the comment at 'in_flight_writes_mutex'
+}
+
+QueryResultCache::InFlightRegistration::InFlightRegistration(
+    QueryResultCache & query_result_cache_, Key key_, std::shared_ptr<InFlightWrite> write_)
+    : query_result_cache(query_result_cache_)
+    , key(std::move(key_))
+    , write(std::move(write_))
+{
+}
+
+QueryResultCache::InFlightRegistration::~InFlightRegistration()
+{
+    unregister();
+}
+
+void QueryResultCache::InFlightRegistration::unregister()
+{
+    if (write)
+    {
+        query_result_cache.finishWrite(key, write);
+        write.reset(); /// makes subsequent calls (there may be one more from the destructor) a no-op
+    }
 }
 
 void QueryResultCache::clear(const std::optional<String> & tag)
