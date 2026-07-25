@@ -5,11 +5,12 @@ sidebar_label: 'MySQL'
 sidebar_position: 50
 slug: /engines/database-engines/mysql
 title: 'MySQL'
+doc_type: 'reference'
 ---
 
 import CloudNotSupportedBadge from '@theme/badges/CloudNotSupportedBadge';
 
-# MySQL Database Engine
+# MySQL database engine
 
 <CloudNotSupportedBadge />
 
@@ -23,11 +24,12 @@ You cannot perform the following queries:
 - `CREATE TABLE`
 - `ALTER`
 
-## Creating a Database {#creating-a-database}
+## Creating a database {#creating-a-database}
 
 ```sql
 CREATE DATABASE [IF NOT EXISTS] db_name [ON CLUSTER cluster]
 ENGINE = MySQL('host:port', ['database' | database], 'user', 'password')
+[SETTINGS enable_compression=0]
 ```
 
 **Engine Parameters**
@@ -37,7 +39,23 @@ ENGINE = MySQL('host:port', ['database' | database], 'user', 'password')
 - `user` — MySQL user.
 - `password` — User password.
 
-## Data Types Support {#data_types-support}
+**Settings**
+
+### `enable_compression` {#enable-compression}
+
+Enables zlib compression for the MySQL protocol connection. When set to `1`, ClickHouse requests protocol-level compression from the MySQL server.
+
+Default value: `0`.
+
+Example:
+
+```sql
+CREATE DATABASE mysql_db
+ENGINE = MySQL('localhost:3306', 'test', 'my_user', 'user_password')
+SETTINGS enable_compression = 1;
+```
+
+## Data types support {#data_types-support}
 
 | MySQL                            | ClickHouse                                                   |
 |----------------------------------|--------------------------------------------------------------|
@@ -54,12 +72,18 @@ ENGINE = MySQL('host:port', ['database' | database], 'user', 'password')
 | DATE                             | [Date](../../sql-reference/data-types/date.md)               |
 | DATETIME, TIMESTAMP              | [DateTime](../../sql-reference/data-types/datetime.md)       |
 | BINARY                           | [FixedString](../../sql-reference/data-types/fixedstring.md) |
+| POINT                            | [Point](../../sql-reference/data-types/geo.md#point)         |
+| LINESTRING                       | [LineString](../../sql-reference/data-types/geo.md#linestring) |
+| POLYGON                          | [Polygon](../../sql-reference/data-types/geo.md#polygon)     |
+| MULTILINESTRING                  | [MultiLineString](../../sql-reference/data-types/geo.md#multilinestring) |
+| MULTIPOLYGON                     | [MultiPolygon](../../sql-reference/data-types/geo.md#multipolygon) |
+| GEOMETRY                         | [Geometry](../../sql-reference/data-types/geo.md#geometry)   |
 
-All other MySQL data types are converted into [String](../../sql-reference/data-types/string.md).
+The conversion of the spatial types (other than `POINT`, which is always converted) is controlled by the `geometry` flag of the [`mysql_datatypes_support_level`](../../operations/settings/settings.md#mysql_datatypes_support_level) setting, enabled by default. The generic `GEOMETRY` column type is mapped to the umbrella [`Geometry`](../../sql-reference/data-types/geo.md#geometry) type (a `Variant` over the concrete geometric types). Because such a column can hold a value of any subtype, reading a value whose subtype has no ClickHouse counterpart (`MULTIPOINT`, `GEOMETRYCOLLECTION`) throws an exception at read time; this incompatibility is accepted in exchange for a proper geometric type. Columns declared with the `MULTIPOINT` or `GEOMETRYCOLLECTION` type are converted into [String](../../sql-reference/data-types/string.md) (the raw WKB) like all other MySQL data types.
 
 [Nullable](../../sql-reference/data-types/nullable.md) is supported.
 
-## Global Variables Support {#global-variables-support}
+## Global variables support {#global-variables-support}
 
 For better compatibility you may address global variables in MySQL style, as `@@identifier`.
 
@@ -77,7 +101,7 @@ Example:
 SELECT @@version;
 ```
 
-## Examples of Use {#examples-of-use}
+## Examples of use {#examples-of-use}
 
 Table in MySQL:
 

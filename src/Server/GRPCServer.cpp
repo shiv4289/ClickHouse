@@ -1,4 +1,4 @@
-#include "GRPCServer.h"
+#include <Server/GRPCServer.h>
 #include <limits>
 #include <memory>
 #include <Poco/Net/SocketAddress.h>
@@ -7,6 +7,7 @@
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/CurrentThread.h>
+#include <Common/QueryScope.h>
 #include <Common/DateLUTImpl.h>
 #include <Common/SettingsChanges.h>
 #include <Common/setThreadName.h>
@@ -46,6 +47,13 @@
 #include <Poco/Util/LayeredConfiguration.h>
 #include <base/range.h>
 #include <Common/logger_useful.h>
+
+#include <absl/base/log_severity.h>
+#include <absl/log/globals.h>
+#include <absl/log/initialize.h>
+#include <absl/log/log_sink_registry.h>
+
+#include <grpc/support/log.h>
 #include <grpc++/security/server_credentials.h>
 #include <grpc++/server.h>
 #include <grpc++/server_builder.h>
@@ -67,12 +75,16 @@ namespace Setting
     extern const SettingsUInt64 interactive_delay;
     extern const SettingsLogsLevel send_logs_level;
     extern const SettingsString send_logs_source_regexp;
-    extern const SettingsUInt64 max_insert_block_size;
+    extern const SettingsNonZeroUInt64 max_insert_block_size;
+    extern const SettingsUInt64 max_insert_block_size_bytes;
+    extern const SettingsUInt64 min_insert_block_size_rows;
+    extern const SettingsUInt64 min_insert_block_size_bytes;
     extern const SettingsUInt64 max_parser_backtracks;
     extern const SettingsUInt64 max_parser_depth;
     extern const SettingsUInt64 max_query_size;
     extern const SettingsBool throw_if_no_data_to_insert;
     extern const SettingsBool use_concurrency_control;
+    extern const SettingsSnappyMode snappy_mode;
 }
 
 namespace ErrorCodes
@@ -90,34 +102,68 @@ namespace ErrorCodes
 namespace
 {
     /// Make grpc to pass logging messages to ClickHouse logging system.
+    class GrpcLogSink : public absl::LogSink
+    {
+    public:
+        void Send(const absl::LogEntry & entry) override
+        {
+            static LoggerRawPtr logger = getRawLogger("grpc");
+
+            const auto msg = std::string(entry.text_message());
+            const auto file = entry.source_filename();
+            int line = entry.source_line();
+
+            switch (entry.log_severity())
+            {
+                case absl::LogSeverity::kInfo:
+                    LOG_INFO(logger, "{} ({}:{})", msg, file, line);
+                    break;
+                case absl::LogSeverity::kWarning:
+                    LOG_WARNING(logger, "{} ({}:{})", msg, file, line);
+                    break;
+                case absl::LogSeverity::kError:
+                    LOG_ERROR(logger, "{} ({}:{})", msg, file, line);
+                    break;
+                case absl::LogSeverity::kFatal:
+                    LOG_ERROR(logger, "FATAL: {} ({}:{})", msg, file, line);
+                    break;
+            }
+        }
+    };
+    GrpcLogSink grpc_log_sink;
+
+    /// See also contrib/grpc/src/core/util/log.cc
     void initGRPCLogging(const Poco::Util::AbstractConfiguration & config)
     {
         static std::once_flag once_flag;
         std::call_once(once_flag, [&config]
         {
-            static LoggerRawPtr logger = getRawLogger("grpc");
-            gpr_set_log_function([](gpr_log_func_args* args)
-            {
-                if (args->severity == GPR_LOG_SEVERITY_DEBUG)
-                    LOG_DEBUG(logger, "{} ({}:{})", args->message, args->file, args->line);
-                else if (args->severity == GPR_LOG_SEVERITY_INFO)
-                    LOG_INFO(logger, "{} ({}:{})", args->message, args->file, args->line);
-                else if (args->severity == GPR_LOG_SEVERITY_ERROR)
-                    LOG_ERROR(logger, "{} ({}:{})", args->message, args->file, args->line);
-            });
+            absl::AddLogSink(&grpc_log_sink);
+            absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
+            absl::InitializeLog();
 
-            if (config.getBool("grpc.verbose_logs", false))
-            {
-                gpr_set_log_verbosity(GPR_LOG_SEVERITY_DEBUG);
+            absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
+
+            const bool verbose = config.getBool("grpc.verbose_logs", false);
+            static LoggerRawPtr logger = getRawLogger("grpc");
+
+            if (verbose)
                 grpc_tracer_set_enabled("all", true);
-            }
-            else if (logger->is(Poco::Message::PRIO_DEBUG))
+
+            if (logger->is(Poco::Message::PRIO_DEBUG))
             {
-                gpr_set_log_verbosity(GPR_LOG_SEVERITY_DEBUG);
+                absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfo);
+                absl::SetVLogLevel("*grpc*/*", 2);
             }
             else if (logger->is(Poco::Message::PRIO_INFORMATION))
             {
-                gpr_set_log_verbosity(GPR_LOG_SEVERITY_INFO);
+                absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfo);
+                absl::SetVLogLevel("*grpc*/*", -1);
+            }
+            else
+            {
+                absl::SetMinLogLevel(absl::LogSeverityAtLeast::kWarning);
+                absl::SetVLogLevel("*grpc*/*", -1);
             }
         });
     }
@@ -165,7 +211,7 @@ namespace
         /// Extracts the settings of transport compression from a query info if possible.
         static std::optional<TransportCompression> fromQueryInfo(const GRPCQueryInfo & query_info)
         {
-            TransportCompression res;
+            TransportCompression res{};
             if (!query_info.transport_compression_type().empty())
             {
                 res.setAlgorithm(query_info.transport_compression_type(), ErrorCodes::INVALID_GRPC_QUERY_INFO);
@@ -201,7 +247,7 @@ namespace
         /// Extracts the settings of transport compression from the server configuration.
         static TransportCompression fromConfiguration(const Poco::Util::AbstractConfiguration & config)
         {
-            TransportCompression res;
+            TransportCompression res{};
             if (config.has("grpc.transport_compression_type"))
             {
                 res.setAlgorithm(config.getString("grpc.transport_compression_type"), ErrorCodes::INVALID_CONFIG_PARAMETER);
@@ -608,8 +654,8 @@ namespace
     private:
         bool nextImpl() override
         {
-            const void * new_pos;
-            size_t new_size;
+            const void * new_pos = nullptr;
+            size_t new_size = 0;
             std::tie(new_pos, new_size) = callback();
             if (!new_size)
                 return false;
@@ -705,7 +751,7 @@ namespace
 
         std::optional<Session> session;
         ContextMutablePtr query_context;
-        std::optional<CurrentThread::QueryScope> query_scope;
+        std::optional<QueryScope> query_scope;
         OpenTelemetry::TracingContextHolderPtr thread_trace_context;
         String query_text;
         ASTPtr ast;
@@ -794,7 +840,7 @@ namespace
     {
         try
         {
-            setThreadName("GRPCServerCall");
+            DB::setThreadName(ThreadName::GRPC_SERVER_CALL);
             receiveQuery();
             executeQuery();
             processInput();
@@ -883,7 +929,7 @@ namespace
         query_context->applySettingsChanges(settings_changes);
 
         query_context->setCurrentQueryId(query_info.query_id());
-        query_scope.emplace(query_context, /* fatal_error_callback */ [this]{ onFatalError(); });
+        query_scope = QueryScope::create(query_context, /* fatal_error_callback */ [this]{ onFatalError(); });
 
         /// Set up tracing context for this query on current thread
         thread_trace_context = std::make_unique<OpenTelemetry::TracingContextHolder>("GRPCServer",
@@ -972,7 +1018,8 @@ namespace
             if (context != query_context)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected context in Input initializer");
             input_function_is_used = true;
-            initializePipeline(input_storage->getInMemoryMetadataPtr()->getSampleBlock());
+            auto metadata_snapshot = input_storage->getInMemoryMetadataPtr(context, false);
+            initializePipeline(metadata_snapshot->getSampleBlock());
         });
 
         query_context->setInputBlocksReaderCallback([this](ContextPtr context) -> Block
@@ -981,7 +1028,7 @@ namespace
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected context in InputBlocksReader");
 
             Block block;
-            while (!block && pipeline_executor->pull(block));
+            while (block.empty() && pipeline_executor->pull(block));
 
             return block;
         });
@@ -1025,7 +1072,7 @@ namespace
         Block block;
         while (pipeline_executor->pull(block))
         {
-            if (block)
+            if (!block.empty())
                 executor.push(block);
         }
 
@@ -1037,7 +1084,7 @@ namespace
 
     void Call::initializePipeline(const Block & header)
     {
-        assert(!read_buffer);
+        chassert(!read_buffer);
         read_buffer = std::make_unique<ReadBufferFromCallback>([this]() -> std::pair<const void *, size_t>
         {
             if (need_input_data_from_insert_query)
@@ -1094,11 +1141,23 @@ namespace
             return {nullptr, 0}; /// no more input data
         });
 
-        read_buffer = wrapReadBufferWithCompressionMethod(std::move(read_buffer), input_compression_method);
+        read_buffer = wrapReadBufferWithCompressionMethod(
+            std::move(read_buffer), input_compression_method,
+            /*zstd_window_log_max=*/ 0, query_context->getSettingsRef()[Setting::snappy_mode]);
 
-        assert(!pipeline);
-        auto source
-            = query_context->getInputFormat(input_format, *read_buffer, header, query_context->getSettingsRef()[Setting::max_insert_block_size]);
+        chassert(!pipeline);
+
+        const Settings & settings = query_context->getSettingsRef();
+
+        auto source = query_context->getInputFormat(
+            input_format,
+            *read_buffer,
+            header,
+            settings[Setting::max_insert_block_size],
+            std::nullopt,
+            settings[Setting::max_insert_block_size_bytes],
+            settings[Setting::min_insert_block_size_rows],
+            settings[Setting::min_insert_block_size_bytes]);
 
         pipeline = std::make_unique<QueryPipeline>(std::move(source));
         pipeline_executor = std::make_unique<PullingPipelineExecutor>(*pipeline);
@@ -1144,11 +1203,8 @@ namespace
                 if (!external_table.data().empty())
                 {
                     /// The data will be written directly to the table.
-                    auto metadata_snapshot = storage->getInMemoryMetadataPtr();
+                    auto metadata_snapshot = storage->getInMemoryMetadataPtr(query_context, false);
                     auto sink = storage->write(ASTPtr(), metadata_snapshot, query_context, /*async_insert=*/false);
-
-                    std::unique_ptr<ReadBuffer> buf = std::make_unique<ReadBufferFromMemory>(external_table.data().data(), external_table.data().size());
-                    buf = wrapReadBufferWithCompressionMethod(std::move(buf), chooseCompressionMethod("", external_table.compression_type()));
 
                     String format = external_table.format();
                     if (format.empty())
@@ -1165,13 +1221,30 @@ namespace
                         external_table_context->checkSettingsConstraints(settings_changes, SettingSource::QUERY);
                         external_table_context->applySettingsChanges(settings_changes);
                     }
+                    const Settings & settings = external_table_context->getSettingsRef();
+
+                    /// Wrap the decompression buffer after the external table's own settings are applied, so a
+                    /// per-table `snappy_mode` in `external_table.settings()` is honored (otherwise it would be
+                    /// read from the outer `query_context` before the per-table settings take effect).
+                    std::unique_ptr<ReadBuffer> buf = std::make_unique<ReadBufferFromMemory>(external_table.data().data(), external_table.data().size());
+                    buf = wrapReadBufferWithCompressionMethod(
+                        std::move(buf), chooseCompressionMethod("", external_table.compression_type()),
+                        /*zstd_window_log_max=*/ 0, settings[Setting::snappy_mode]);
+
                     auto in = external_table_context->getInputFormat(
-                        format, *buf, metadata_snapshot->getSampleBlock(), external_table_context->getSettingsRef()[Setting::max_insert_block_size]);
+                        format,
+                        *buf,
+                        metadata_snapshot->getSampleBlock(),
+                        settings[Setting::max_insert_block_size],
+                        std::nullopt,
+                        settings[Setting::max_insert_block_size_bytes],
+                        settings[Setting::min_insert_block_size_rows],
+                        settings[Setting::min_insert_block_size_bytes]);
 
                     QueryPipelineBuilder cur_pipeline;
                     cur_pipeline.init(Pipe(std::move(in)));
                     cur_pipeline.addTransform(std::move(sink));
-                    cur_pipeline.setSinks([&](const Block & header, Pipe::StreamType)
+                    cur_pipeline.setSinks([&](const SharedHeader & header, Pipe::StreamType)
                     {
                         return std::make_shared<EmptySink>(header);
                     });
@@ -1230,7 +1303,9 @@ namespace
         nested_write_buffer = static_cast<WriteBufferFromVector<PODArray<char>> *>(write_buffer.get());
         if (output_compression_method != CompressionMethod::None)
         {
-            write_buffer = wrapWriteBufferWithCompressionMethod(std::move(write_buffer), output_compression_method, output_compression_level);
+            write_buffer = wrapWriteBufferWithCompressionMethod(
+                std::move(write_buffer), output_compression_method, output_compression_level,
+                /*zstd_window_log=*/ 0, query_context->getSettingsRef()[Setting::snappy_mode]);
             compressing_write_buffer = write_buffer.get();
         }
 
@@ -1270,7 +1345,7 @@ namespace
                 if (!check_for_cancel())
                     break;
 
-                if (block && !io.null_format)
+                if (!block.empty() && !io.null_format)
                     output_format_processor->write(materializeBlock(block));
 
                 if (after_send_progress.elapsedMicroseconds() >= interactive_delay)
@@ -1332,7 +1407,7 @@ namespace
 
         LOG_INFO(
             log,
-            "Finished call {} in {} secs. (including reading by client: {}, writing by client: {})",
+            "Finished call {} in {:.3f} secs. (including reading by client: {:.3f}, writing by client: {:.3f})",
             getCallName(call_type),
             query_time.elapsedSeconds(),
             static_cast<double>(waited_for_client_reading) / 1000000000ULL,
@@ -1382,7 +1457,7 @@ namespace
                 addLogsToResult();
                 sendResult();
             }
-            catch (...) // NOLINT(bugprone-empty-catch)
+            catch (const std::exception &) // NOLINT(bugprone-empty-catch)
             {
             }
         }
@@ -1394,7 +1469,7 @@ namespace
         /// because the client may decide to send another query with the same query ID or session ID
         /// immediately after it receives our final result, and it's prohibited to have
         /// two queries executed at the same time with the same query ID or session ID.
-        io.process_list_entry.reset();
+        io.process_list_entries.clear();
         if (query_context)
             query_context->setProcessListElement(nullptr);
         if (session)
@@ -1405,7 +1480,7 @@ namespace
     {
         responder.reset();
         pipeline_executor.reset();
-        pipeline.reset();
+        pipeline = nullptr;
         output_format_processor.reset();
         read_buffer.reset();
         write_buffer.reset();
@@ -1549,14 +1624,16 @@ namespace
 
     void Call::addTotalsToResult(const Block & totals)
     {
-        if (!totals)
+        if (totals.empty())
             return;
 
         PODArray<char> memory;
         if (output_compression_method != CompressionMethod::None)
             memory.resize(DBMS_DEFAULT_BUFFER_SIZE); /// Must have enough space for compressed data.
         std::unique_ptr<WriteBuffer> buf = std::make_unique<WriteBufferFromVector<PODArray<char>>>(memory);
-        buf = wrapWriteBufferWithCompressionMethod(std::move(buf), output_compression_method, output_compression_level);
+        buf = wrapWriteBufferWithCompressionMethod(
+            std::move(buf), output_compression_method, output_compression_level,
+            /*zstd_window_log=*/ 0, query_context->getSettingsRef()[Setting::snappy_mode]);
         auto format = query_context->getOutputFormat(output_format, *buf, totals);
         format->write(materializeBlock(totals));
         format->finalize();
@@ -1567,14 +1644,16 @@ namespace
 
     void Call::addExtremesToResult(const Block & extremes)
     {
-        if (!extremes)
+        if (extremes.empty())
             return;
 
         PODArray<char> memory;
         if (output_compression_method != CompressionMethod::None)
             memory.resize(DBMS_DEFAULT_BUFFER_SIZE); /// Must have enough space for compressed data.
         std::unique_ptr<WriteBuffer> buf = std::make_unique<WriteBufferFromVector<PODArray<char>>>(memory);
-        buf = wrapWriteBufferWithCompressionMethod(std::move(buf), output_compression_method, output_compression_level);
+        buf = wrapWriteBufferWithCompressionMethod(
+            std::move(buf), output_compression_method, output_compression_level,
+            /*zstd_window_log=*/ 0, query_context->getSettingsRef()[Setting::snappy_mode]);
         auto format = query_context->getOutputFormat(output_format, *buf, extremes);
         format->write(materializeBlock(extremes));
         format->finalize();
@@ -1630,13 +1709,13 @@ namespace
                 auto & log_entry = *result.add_logs();
                 log_entry.set_time(column_time.getElement(row));
                 log_entry.set_time_microseconds(column_time_microseconds.getElement(row));
-                std::string_view query_id = column_query_id.getDataAt(row).toView();
+                std::string_view query_id = column_query_id.getDataAt(row);
                 log_entry.set_query_id(query_id.data(), query_id.size());
                 log_entry.set_thread_id(column_thread_id.getElement(row));
                 log_entry.set_level(static_cast<::clickhouse::grpc::LogsLevel>(column_level.getElement(row)));
-                std::string_view source = column_source.getDataAt(row).toView();
+                std::string_view source = column_source.getDataAt(row);
                 log_entry.set_source(source.data(), source.size());
-                std::string_view text = column_text.getDataAt(row).toView();
+                std::string_view text = column_text.getDataAt(row);
                 log_entry.set_text(text.data(), text.size());
             }
         }
@@ -1656,7 +1735,7 @@ namespace
         /// Copy output to `result.output`, with optional compressing.
         if (write_buffer)
         {
-            size_t output_size;
+            size_t output_size = 0;
             if (send_final_message)
             {
                 if (compressing_write_buffer)
@@ -1859,7 +1938,7 @@ private:
 
     void run()
     {
-        setThreadName("GRPCServerQueue");
+        DB::setThreadName(ThreadName::GRPC_SERVER_QUEUE);
 
         bool ok = false;
         void * tag = nullptr;

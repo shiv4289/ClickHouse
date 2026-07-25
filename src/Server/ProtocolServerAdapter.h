@@ -10,7 +10,7 @@
 namespace DB
 {
 
-class GRPCServer;
+class IGRPCServer;
 class TCPServer;
 
 /// Provides an unified interface to access a protocol implementing server
@@ -33,12 +33,21 @@ public:
         const std::string & listen_host_,
         const char * port_name_,
         const std::string & description_,
-        std::unique_ptr<GRPCServer> grpc_server_,
+        std::unique_ptr<IGRPCServer> grpc_server_,
         bool supports_runtime_reconfiguration_ = true);
 #endif
 
     /// Starts the server. A new thread will be created that waits for and accepts incoming connections.
-    void start() { impl->start(); }
+    /// Does nothing if the server has already been started: a server may be started ahead of the
+    /// common start loop (e.g. Prometheus starts before tables are loaded), and the underlying
+    /// implementation does not support being started twice.
+    void start()
+    {
+        if (started)
+            return;
+        impl->start();
+        started = true;
+    }
 
     /// Stops the server. No new connections will be accepted.
     void stop() { impl->stop(); }
@@ -85,6 +94,7 @@ private:
     std::string description;
     std::unique_ptr<Impl> impl;
     bool supports_runtime_reconfiguration = true;
+    bool started = false;
 };
 
 }

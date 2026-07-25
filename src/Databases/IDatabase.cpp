@@ -1,12 +1,15 @@
 #include <memory>
 #include <Databases/IDatabase.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/TableNameHints.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Storages/IStorage.h>
 #include <Common/CurrentMetrics.h>
+#include <Common/Exception.h>
 #include <Common/NamePrompter.h>
 #include <Common/quoteString.h>
+#include <Common/AsyncLoader.h>
 
 
 namespace CurrentMetrics
@@ -22,6 +25,7 @@ namespace ErrorCodes
     extern const int CANNOT_BACKUP_TABLE;
     extern const int CANNOT_RESTORE_TABLE;
     extern const int CANNOT_GET_CREATE_TABLE_QUERY;
+    extern const int CANNOT_GET_CREATE_DICTIONARY_QUERY;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int UNKNOWN_TABLE;
@@ -48,6 +52,47 @@ StoragePtr IDatabase::getTable(const String & name, ContextPtr context) const
         backQuoteIfNeed(hint.second));
 }
 
+ASTPtr IDatabase::getCreateTableQuery(const String & name, ContextPtr context) const
+{
+    try
+    {
+        return getCreateTableQueryImpl(name, context, /*throw_on_error=*/ true);
+    }
+    catch (Exception & e)
+    {
+        /// When the table does not exist, augment the error with a "Maybe you meant ...?" hint,
+        /// like the one shown for `SELECT` queries. `getCreateTableQueryImpl` reports a missing
+        /// table with one of these error codes.
+        const bool table_is_missing = e.code() == ErrorCodes::UNKNOWN_TABLE
+            || e.code() == ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY
+            || e.code() == ErrorCodes::CANNOT_GET_CREATE_DICTIONARY_QUERY;
+
+        /// Double-check the table is really absent, so we do not attach a misleading hint when the
+        /// error was raised for a different reason (e.g. `DatabaseMySQL` and
+        /// `DatabaseMaterializedPostgreSQL` also report `CANNOT_GET_CREATE_TABLE_QUERY` for a
+        /// transient failure to fetch metadata from the remote database). Hints are computed here,
+        /// outside of any database lock held by `getCreateTableQueryImpl`, to avoid a deadlock.
+        /// `isTableExist` can itself throw for the same remote engines (it re-fetches metadata);
+        /// in that case we cannot confirm absence, so give up on the hint and preserve the original
+        /// exception instead of letting the new one replace it.
+        try
+        {
+            if (table_is_missing && !isTableExist(name, context))
+            {
+                TableNameHints hints(this->shared_from_this(), context);
+                auto hint = hints.getHintForTable(name);
+                if (!hint.first.empty())
+                    e.addMessage("Maybe you meant {}.{}?", backQuoteIfNeed(hint.first), backQuoteIfNeed(hint.second));
+            }
+        }
+        catch (...)
+        {
+            tryLogCurrentException(__PRETTY_FUNCTION__, "Failed to check whether the table exists while computing a hint for a missing table");
+        }
+        throw;
+    }
+}
+
 IDatabase::IDatabase(String database_name_) : database_name(std::move(database_name_))
 {
     CurrentMetrics::add(CurrentMetrics::AttachedDatabase, 1);
@@ -58,7 +103,7 @@ IDatabase::~IDatabase()
     CurrentMetrics::sub(CurrentMetrics::AttachedDatabase, 1);
 }
 
-void IDatabase::alterDatabaseComment(const AlterCommand & /*command*/)
+void IDatabase::alterDatabaseComment(const AlterCommand & /*command*/, ContextPtr /*query_context*/)
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{}: ALTER DATABASE COMMENT is not supported", getEngineName());
 }
@@ -181,7 +226,8 @@ void IDatabase::renameTable(
 void IDatabase::alterTable(
     ContextPtr /*context*/,
     const StorageID & /*table_id*/,
-    const StorageInMemoryMetadata & /*metadata*/)
+    const StorageInMemoryMetadata & /*metadata*/,
+    const bool /*validate_new_create_query*/)
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{}: alterTable() is not supported", getEngineName());
 }
@@ -203,7 +249,7 @@ void IDatabase::stopReplication()
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Database engine {} does not run a replication thread", getEngineName());
 }
 
-BlockIO IDatabase::tryEnqueueReplicatedDDL(const ASTPtr & /*query*/, ContextPtr /*query_context*/, [[maybe_unused]] QueryFlags flags) /// NOLINT
+BlockIO IDatabase::tryEnqueueReplicatedDDL(const ASTPtr & /*query*/, ContextPtr /*query_context*/, [[maybe_unused]] QueryFlags flags, DDLGuardPtr && /*database_guard*/) /// NOLINT
 {
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Database engine {} does not have replicated DDL queue", getEngineName());
 }
@@ -215,5 +261,8 @@ ASTPtr IDatabase::getCreateTableQueryImpl(const String & /*name*/, ContextPtr /*
     return nullptr;
 }
 
-
+DiskPtr IDatabase::getDisk() const
+{
+    return Context::getGlobalContextInstance()->getDatabaseDisk();
+}
 }

@@ -47,11 +47,15 @@ ConnectionPoolWithFailover::ConnectionPoolWithFailover(
 
     get_priority_load_balancing.hostname_prefix_distance.resize(nested_pools.size());
     get_priority_load_balancing.hostname_levenshtein_distance.resize(nested_pools.size());
+    get_priority_load_balancing.hostname_longest_common_prefix.resize(nested_pools.size());
+    get_priority_load_balancing.hostname_longest_common_suffix.resize(nested_pools.size());
     for (size_t i = 0; i < nested_pools.size(); ++i)
     {
         ConnectionPool & connection_pool = dynamic_cast<ConnectionPool &>(*nested_pools[i]);
         get_priority_load_balancing.hostname_prefix_distance[i] = getHostNamePrefixDistance(local_hostname, connection_pool.getHost());
         get_priority_load_balancing.hostname_levenshtein_distance[i] = getHostNameLevenshteinDistance(local_hostname, connection_pool.getHost());
+        get_priority_load_balancing.hostname_longest_common_prefix[i] = getHostNameLongestCommonPrefix(local_hostname, connection_pool.getHost());
+        get_priority_load_balancing.hostname_longest_common_suffix[i] = getHostNameLongestCommonSuffix(local_hostname, connection_pool.getHost());
     }
 }
 
@@ -63,12 +67,11 @@ IConnectionPool::Entry ConnectionPoolWithFailover::get(const ConnectionTimeouts 
     settings[Setting::distributed_replica_max_ignored_errors] = 0;
     settings[Setting::fallback_to_stale_replicas_for_distributed_queries] = true;
 
-    return get(timeouts, settings, /* force_connected= */ true);
+    return get(timeouts, settings);
 }
 
 IConnectionPool::Entry ConnectionPoolWithFailover::get(const ConnectionTimeouts & timeouts,
-                                                       const Settings & settings,
-                                                       bool /*force_connected*/)
+                                                       const Settings & settings)
 {
     if (nested_pools.empty())
         throw DB::Exception(DB::ErrorCodes::ALL_CONNECTION_TRIES_FAILED,
@@ -89,12 +92,17 @@ IConnectionPool::Entry ConnectionPoolWithFailover::get(const ConnectionTimeouts 
     return Base::get(max_ignored_errors, fallback_to_stale_replicas, try_get_entry, get_priority);
 }
 
+IConnectionPool::Entry ConnectionPoolWithFailover::getUnchecked(const ConnectionTimeouts & timeouts, const Settings & settings)
+{
+    return get(timeouts, settings);
+}
+
 ConnectionPoolWithFailover::Status ConnectionPoolWithFailover::getStatus() const
 {
     const auto [states, pools, error_decrease_time] = getPoolExtendedStates();
     // NOTE: to avoid data races do not touch any data of ConnectionPoolWithFailover or PoolWithFailoverBase in the code below.
 
-    assert(states.size() == pools.size());
+    chassert(states.size() == pools.size());
 
     ConnectionPoolWithFailover::Status result;
     result.reserve(states.size());
@@ -208,7 +216,7 @@ std::vector<ConnectionPoolWithFailover::TryResult> ConnectionPoolWithFailover::g
     size_t min_entries = skip_unavailable_endpoints.value() ? 0 : 1;
 
     size_t max_tries = settings[Setting::connections_with_failover_max_tries];
-    size_t max_entries;
+    size_t max_entries = 0;
     if (pool_mode == PoolMode::GET_ALL)
     {
         min_entries = nested_pools.size();
@@ -252,6 +260,7 @@ ConnectionPoolWithFailover::tryGetEntry(
         while (true)
         {
             connection_establisher_async.resume();
+
             if (connection_establisher_async.isFinished())
                 break;
 

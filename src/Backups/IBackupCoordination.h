@@ -1,6 +1,7 @@
 #pragma once
 
 #include <exception>
+#include <functional>
 #include <Core/Types.h>
 
 
@@ -21,6 +22,8 @@ class IBackupCoordination
 public:
     virtual ~IBackupCoordination() = default;
 
+    virtual void startup() {}
+
     /// Sets that the backup query was sent to other hosts.
     /// Function waitOtherHostsFinish() will check that to find out if it should really wait or not.
     virtual void setBackupQueryIsSentToOtherHosts() = 0;
@@ -30,23 +33,31 @@ public:
     virtual Strings setStage(const String & new_stage, const String & message, bool sync) = 0;
 
     /// Lets other hosts know that the current host has encountered an error.
-    /// Returns true if the information is successfully passed so other hosts can read it.
-    virtual bool setError(std::exception_ptr exception, bool throw_if_error) = 0;
+    virtual void setError(std::exception_ptr exception, bool throw_if_error) = 0;
+
+    /// Returns true if some host (the current host or one of the other hosts) has encountered an error.
+    virtual bool isErrorSet() const = 0;
 
     /// Waits until all the other hosts finish their work.
     /// Stops waiting and throws an exception if another host encounters an error or if some host gets cancelled.
-    virtual bool waitOtherHostsFinish(bool throw_if_error) const = 0;
+    virtual void waitOtherHostsFinish(bool throw_if_error) const = 0;
 
     /// Lets other hosts know that the current host has finished its work.
-    virtual bool finish(bool throw_if_error) = 0;
+    virtual void finish(bool throw_if_error) = 0;
+
+    /// Returns true if this host finished its work (i.e. finish() was called successfully).
+    virtual bool finished() const = 0;
+
+    /// Returns true if all the hosts finished their work.
+    virtual bool allHostsFinished() const = 0;
 
     /// Removes temporary nodes in ZooKeeper.
-    virtual bool cleanup(bool throw_if_error) = 0;
+    virtual void cleanup(bool throw_if_error) = 0;
 
     struct PartNameAndChecksum
     {
         String part_name;
-        UInt128 checksum;
+        UInt128 checksum{};
     };
 
     /// Adds part names which a specified replica of a replicated table is going to put to the backup.
@@ -98,8 +109,16 @@ public:
     /// Adds file information.
     /// If specified checksum+size are new for this IBackupContentsInfo the function sets `is_data_file_required`.
     virtual void addFileInfos(BackupFileInfos && file_infos) = 0;
-    virtual BackupFileInfos getFileInfos() const = 0;
-    virtual BackupFileInfos getFileInfosForAllHosts() const = 0;
+    /// Returns the file infos of the current host by reference to avoid copying them (a backup can contain millions).
+    /// The reference is valid until the coordination is destroyed. It must only be called after file collection has
+    /// finished (i.e. no more addFileInfos()), because the referenced storage is immutable only after preparation.
+    virtual const BackupFileInfos & getFileInfos() const = 0;
+
+    /// Iterates the file infos of all hosts in place, without copying them into a vector
+    /// (a backup can contain millions).
+    /// The callback may be called while an internal coordination mutex is held; it must not call back
+    /// into IBackupCoordination (risk of deadlocks). Prefer keeping the callback lightweight to avoid long critical sections.
+    virtual void forEachFileInfoForAllHosts(const std::function<void(const BackupFileInfo &)> & callback) const = 0;
 
     /// Starts writing a specified file, the function returns false if that file is already being written concurrently.
     virtual bool startWritingFile(size_t data_file_index) = 0;
