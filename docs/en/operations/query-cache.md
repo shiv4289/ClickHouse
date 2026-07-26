@@ -94,6 +94,15 @@ are removed from the AST.
 
 If the query was aborted due to an exception or user cancellation, no entry is written into the query cache.
 
+If multiple, concurrently running queries are identical (same AST, current database and relevant settings) and none of them has a
+(non-stale) result in the query cache yet, only one of them actually computes the result and inserts it into the query cache. The other,
+concurrent queries wait for it to finish and then reuse ("steal") its result instead of also computing it. This is controlled by setting
+[query_cache_synchronize_concurrent_queries](/operations/settings/settings#query_cache_synchronize_concurrent_queries) (enabled by
+default). If the query which computes the result fails, is cancelled, or decides not to cache its result after all (e.g. because of
+[query_cache_min_query_runs](/operations/settings/settings#query_cache_min_query_runs) or
+[query_cache_min_query_duration](/operations/settings/settings#query_cache_min_query_duration)), the waiting queries compute the result
+themselves.
+
 The size of the query cache in bytes, the maximum number of cache entries and the maximum size of individual cache entries (in bytes and in
 records) can be configured using different [server configuration options](/operations/server-configuration-parameters/settings#query_cache).
 
