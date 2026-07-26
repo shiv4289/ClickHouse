@@ -37,13 +37,12 @@ namespace ProfileEvents
 {
     extern const Event QueryCacheHits;
     extern const Event QueryCacheMisses;
-    extern const Event QueryCacheSynchronizedQueries;
-};
     extern const Event QueryCacheAgeSeconds;
     extern const Event QueryCacheReadRows;
     extern const Event QueryCacheReadBytes;
     extern const Event QueryCacheWrittenRows;
     extern const Event QueryCacheWrittenBytes;
+    extern const Event QueryCacheSynchronizedQueries;
 }
 
 namespace CurrentMetrics
@@ -679,7 +678,6 @@ void QueryResultCacheWriter::finalizeWrite()
     /// unregister() is idempotent, so it is safe that the destructor of 'in_flight_registration' also calls it unconditionally later.
     SCOPE_EXIT({ in_flight_registration.unregister(); });
 
-    std::lock_guard lock(mutex);
     /// Multiple StreamInQueryResultCacheTransform instances (for Main/Totals/Extremes streams) share
     /// the same writer. The first call finalizes; subsequent calls are no-ops. This is correct because
     /// all transforms buffer into the same query_result before any of them calls finalizeWrite.

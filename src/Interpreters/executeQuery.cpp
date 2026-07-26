@@ -1817,7 +1817,7 @@ static BlockIO executeQueryImpl(
                       && settings[Setting::query_cache_synchronize_concurrent_queries]))
                     return false;
 
-                QueryResultCache::Key key(out_ast, context->getCurrentDatabase(), *settings_copy, context->getCurrentQueryId(), context->getUserID(), context->getCurrentRoles());
+                QueryResultCache::Key key(out_ast, context->getCurrentDatabase(), *settings_copy, context->getCurrentQueryId(), context->getUserID(), context->getCurrentRoles(), /* is_subquery = */ false);
                 query_result_cache->waitForConcurrentInsert(
                     key,
                     [&]() { return process_list_entry && process_list_entry->getQueryStatus()->isKilled(); });

@@ -299,12 +299,11 @@ private:
     const size_t max_block_size;
     Cache::MappedPtr query_result TSA_GUARDED_BY(mutex) = std::make_shared<QueryResultCache::Entry>();
     std::atomic<bool> skip_insert = false;
-    bool was_finalized = false;
+    std::atomic<bool> was_finalized = false;
     /// RAII registration of 'key' as being written (see QueryResultCache::InFlightRegistration); a no-op handle (as opposed to an empty
     /// std::optional) if this Writer never became the one query allowed to insert 'key', e.g. because a fresh entry already existed in
     /// the cache, or another writer registered for it first.
     QueryResultCache::InFlightRegistration in_flight_registration;
-    std::atomic<bool> was_finalized = false;
     LoggerPtr logger = getLogger("QueryResultCache");
 
     /// 'skip_insert_' and 'in_flight_write_' are determined by QueryResultCache::createWriter() while it holds
